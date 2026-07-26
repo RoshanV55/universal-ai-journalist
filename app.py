@@ -1,5 +1,7 @@
 import os
 import json
+import ast
+import re
 import asyncio
 import requests
 import torch
@@ -13,6 +15,27 @@ from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from ddgs import DDGS
 from pyvis.network import Network
+
+def safe_parse_json(json_str: str):
+    json_str = json_str.strip()
+    try:
+        return json.loads(json_str)
+    except Exception:
+        pass
+    try:
+        processed = re.sub(r'\btrue\b', 'True', json_str)
+        processed = re.sub(r'\bfalse\b', 'False', processed)
+        processed = re.sub(r'\bnull\b', 'None', processed)
+        return ast.literal_eval(processed)
+    except Exception:
+        pass
+    try:
+        cleaned = re.sub(r',\s*([\]}])', r'\1', json_str)
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    return json.loads(json_str)
+
 
 # --- Environment Configuration ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -207,13 +230,14 @@ async def build_knowledge_graph(disambiguated_facts: list[str]) -> dict:
         json_start = response.find("{")
         json_end = response.rfind("}") + 1
         if json_start != -1 and json_end != -1:
-            graph_data = json.loads(response[json_start:json_end])
+            graph_data = safe_parse_json(response[json_start:json_end])
             return graph_data
         else:
             st.warning("No valid JSON structure detected in Ollama response.")
             return {"nodes": [], "edges": []}
     except Exception as e:
         st.warning(f"Error parsing graph JSON: {e}")
+        st.error(f"Raw Ollama Response: {repr(response)}")
         return {"nodes": [], "edges": []}
 
 # Stage 3B: Critic Loop Verification Agent
@@ -258,7 +282,7 @@ async def verify_triples_critic(raw_text_corpus: str, unverified_graph: dict) ->
         json_start = response.find("[")
         json_end = response.rfind("]") + 1
         if json_start != -1 and json_end != -1:
-            verdict_list = json.loads(response[json_start:json_end])
+            verdict_list = safe_parse_json(response[json_start:json_end])
             
             passed_ids = {item["id"] for item in verdict_list if item.get("status") == 1}
             verified_edges = [edge for idx, edge in enumerate(edges) if idx in passed_ids]
@@ -315,7 +339,7 @@ async def create_chapter_outline(topic: str, num_chapters: int, graph_data: dict
         json_start = response.find("[")
         json_end = response.rfind("]") + 1
         if json_start != -1 and json_end != -1:
-            outlines = json.loads(response[json_start:json_end])
+            outlines = safe_parse_json(response[json_start:json_end])
             if len(outlines) == num_chapters:
                 return outlines
     except Exception as e:
@@ -420,13 +444,16 @@ async def async_research_pipeline():
     async with AsyncWebCrawler(config=browser_config) as crawler:
         results = await crawler.arun_many(urls=urls, config=run_config)
         for idx, res in enumerate(results):
+            # SAFE URL RETRIEVAL TO PREVENT INDEX ERROR
+            scraped_url = getattr(res, 'url', None) or (urls[idx] if idx < len(urls) else f"Source #{idx+1}")
+            
             if res.success and res.markdown:
                 content = getattr(res.markdown, 'fit_markdown', res.markdown)
                 if content and str(content).strip():
                     raw_corpus += f"\n{content}"
-                    status_box.write(f"✅ Scraped Source #{idx+1}: {urls[idx]}")
+                    status_box.write(f"✅ Scraped Source #{idx+1}: {scraped_url}")
                     continue
-            status_box.write(f"⚠️ Warning: Failed to scrape Source #{idx+1}")
+            status_box.write(f"⚠️ Warning: Failed to scrape Source #{idx+1}: {scraped_url}")
                 
     if not raw_corpus.strip():
         status_box.update(label="❌ Scraping Failed.", state="error")
@@ -502,15 +529,14 @@ async def async_research_pipeline():
 # --- Event Loop Wrapper ---
 def run_app():
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = None
 
-    if loop.is_running():
-        loop.create_task(async_research_pipeline())
+    if loop and loop.is_running():
+        asyncio.ensure_future(async_research_pipeline())
     else:
-        loop.run_until_complete(async_research_pipeline())
+        asyncio.run(async_research_pipeline())
 
 if st.button("🚀 Execute Autonomous Research & Generation Campaign", type="primary"):
     run_app()
