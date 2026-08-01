@@ -5,16 +5,39 @@ import re
 import asyncio
 import requests
 import torch
+import nest_asyncio
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image
 from diffusers import FluxPipeline, FluxTransformer2DModel
 from transformers import T5EncoderModel, BitsAndBytesConfig
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
-from crawl4ai.content_filter_strategy import PruningContentFilter
-from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from ddgs import DDGS
 from pyvis.network import Network
+import streamlit.components.v1 as components
+
+
+def extract_and_sanitize_json(raw_response: str) -> dict | list:
+    """Extracts, cleans, and parses JSON output from LLM responses."""
+    if not raw_response or not isinstance(raw_response, str):
+        return {}
+        
+    # Remove markdown codeblock fences if present
+    cleaned = re.sub(r'```[a-zA-Z]*', '', raw_response)
+    cleaned = cleaned.replace('```', '').strip()
+    
+    # Locate boundaries
+    json_start = min([pos for pos in [cleaned.find('{'), cleaned.find('[')] if pos != -1], default=-1)
+    json_end = max([cleaned.rfind('}'), cleaned.rfind(']')], default=-1) + 1
+    
+    if json_start != -1 and json_end != -1:
+        json_str = cleaned[json_start:json_end]
+        
+        # Repair common unescaped key quote typos from local LLMs (e.g., {"id: "val"} -> {"id": "val"})
+        json_str = re.sub(r'([{\[,])\s*"([^"]*?):', r'\1"\2":', json_str)
+        
+        return safe_parse_json(json_str)
+        
+    return {}
 
 def safe_parse_json(json_str: str):
     json_str = json_str.strip()
@@ -34,8 +57,7 @@ def safe_parse_json(json_str: str):
         return json.loads(cleaned)
     except Exception:
         pass
-    return json.loads(json_str)
-
+    return {}
 
 # --- Environment Configuration ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -44,11 +66,15 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+# --- Initialize Execution Lock State ---
+if "is_running" not in st.session_state:
+    st.session_state.is_running = False
+
 # --- Streamlit Page Setup ---
 st.set_page_config(page_title="AI Investigative Journalist & KG Generator", page_icon="📰", layout="wide")
 
 st.title("📰 Universal AI Investigative Journalist & Knowledge Graph Engine")
-st.caption("Deep research via Crawl4AI, Fact Disambiguation, Critic-Verified Knowledge Graphs, and local FLUX.1 generation.")
+st.caption("Deep research via Crawl4AI, Custom Ingestion, Anti-Bot Engine, Fact Disambiguation, and Knowledge Graphs.")
 
 # --- Local FLUX.1 Model Loader (Cached) ---
 @st.cache_resource
@@ -89,20 +115,74 @@ def load_local_flux_pipeline():
     
     return pipe
 
-# --- UI Sidebar ---
-st.sidebar.header("Research & Generation Configurations")
-max_links = st.sidebar.slider("Maximum Web Links to Explore", min_value=2, max_value=12, value=5)
-chunk_size = st.sidebar.slider("Extraction Window Size (Words)", min_value=800, max_value=2500, value=1500)
-temperature = st.sidebar.slider("Model Temperature (Creativity Control)", min_value=0.0, max_value=1.0, value=0.1)
-num_chapters = st.sidebar.slider("Number of Chapters to Generate", min_value=2, max_value=6, value=3)
-enable_images = st.sidebar.checkbox("Generate Local FLUX.1 Images for Chapters", value=True)
+# --- UI Sidebar Setup ---
+st.sidebar.header("Research Configurations")
+
+# Data Ingestion Mode Selection
+scrape_mode = st.sidebar.radio(
+    "Data Source Selection Mode:",
+    options=["Web Search + Custom Links", "Custom Links Only"],
+    help="Choose whether to search the web, crawl specific custom links, or combine both."
+)
+
+custom_urls_input = st.sidebar.text_area(
+    "Custom Website URLs (one per line):",
+    placeholder="https://example.com/article1\nhttps://example.com/article2",
+    height=120,
+    help="Add websites (non-video) you wish to extract data from."
+)
+
+enable_stealth_browser = st.sidebar.checkbox(
+    "Enable Anti-Bot Stealth Engine",
+    value=True,
+    help="Uses stealth browser signatures and anti-detection evasion techniques."
+)
+
+interactive_fallback = st.sidebar.checkbox(
+    "Headed Mode (Visual Browser)",
+    value=False,
+    help="Launches a visible browser window if websites require manual verification."
+)
+
+max_links = st.sidebar.slider("Maximum Web Links to Explore", min_value=5, max_value=12, value=5, disabled=st.session_state.is_running)
+chunk_size = st.sidebar.slider("Extraction Window Size (Words)", min_value=800, max_value=2500, value=1500, disabled=st.session_state.is_running)
+temperature = st.sidebar.slider("Model Temperature (Creativity Control)", min_value=0.0, max_value=1.0, value=0.1, disabled=st.session_state.is_running)
+num_chapters = st.sidebar.slider("Number of Chapters to Generate", min_value=1, max_value=6, value=3, disabled=st.session_state.is_running)
+enable_images = st.sidebar.checkbox("Generate Local FLUX.1 Images for Chapters", value=False,disabled=st.session_state.is_running)
 
 # Main Topic Input
 topic = st.text_area(
     "Enter Deep Research Target / Investigative Topic:",
-    value="Quantum Computing advances and challenges",
-    height=70
+    value="",
+    height=70,
+    disabled=st.session_state.is_running,
 )
+# --- URL Parsing Helper ---
+def parse_and_clean_urls(raw_text: str) -> list[str]:
+    """Extracts valid web URLs from text split by newlines, commas, spaces, or semicolons."""
+    raw_urls = [
+        u.strip()
+        for u in re.split(r'[\n,\s;]+', raw_text)
+        if u.strip()
+    ]
+    
+    valid_urls = []
+    blocked_domains = ["youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "dailymotion.com"]
+    
+    for url in raw_urls:
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+            
+        if not any(domain in url.lower() for domain in blocked_domains):
+            # Target GitHub README directly if a raw repo link is provided
+            if "github.com" in url.lower() and not ("raw.githubusercontent.com" in url or "blob/" in url):
+                clean_url = url.rstrip("/")
+                # Convert github.com/owner/repo to direct raw README source
+                url = f"{clean_url}/raw/main/README.md"
+
+            valid_urls.append(url)
+            
+    return list(dict.fromkeys(valid_urls))
 
 # --- Helper Functions ---
 async def search_web(query: str, max_links: int) -> list[str]:
@@ -155,11 +235,10 @@ def generate_local_flux_image(pipe: FluxPipeline, prompt: str) -> Image.Image | 
         st.error(f"Local FLUX.1 Generation Error: {e}")
         return None
 
-# --- Pipeline Modules: 4-Stage Zero-Hallucination Architecture ---
+# --- Pipeline Modules ---
 
 # Stage 1: Noise & Ad Filter
 async def filter_relevant_chunks(chunks: list[str], topic: str) -> list[str]:
-    """Stage 1: Filters out scrapings from sidebars, ads, and off-topic noise before processing."""
     relevant_chunks = []
     for chunk in chunks:
         filter_prompt = f"""
@@ -180,7 +259,6 @@ async def filter_relevant_chunks(chunks: list[str], topic: str) -> list[str]:
 
 # Stage 2: Fact Disambiguation
 async def disambiguate_facts(raw_text: str) -> list[str]:
-    """Stage 2: Fact Disambiguation - Converts unstructured text into clear, unambiguous statements."""
     prompt = f"""
     Task: Convert the following raw text into a list of standalone, unambiguous facts.
     
@@ -199,14 +277,13 @@ async def disambiguate_facts(raw_text: str) -> list[str]:
 
 # Stage 3A: Universal Knowledge Graph Extraction
 async def build_knowledge_graph(disambiguated_facts: list[str]) -> dict:
-    """Stage 3A: Universal Knowledge Graph Engine - Extracts Candidate JSON Triples for any topic."""
     facts_block = "\n".join(f"- {f}" for f in disambiguated_facts)
     
     prompt = f"""
     You are an expert Knowledge Graph Extraction Engine.
     Extract Subject-Predicate-Object triples from the provided factual statements.
 
-    OUTPUT FORMAT: Return strictly valid JSON in this exact structure:
+    OUTPUT FORMAT: Return strictly valid JSON in this exact structure without markdown tags:
     {{
       "nodes": [
         {{"id": "Entity Name", "type": "Person/Organization/Location/Concept/Event/Metric/Date/Technology"}}
@@ -217,32 +294,25 @@ async def build_knowledge_graph(disambiguated_facts: list[str]) -> dict:
     }}
 
     CRITICAL RULES:
-    1. Output strictly valid JSON. Do not include markdown commentary around the JSON.
+    1. Output strictly valid raw JSON only. Do not wrap in markdown syntax or block quotes.
     2. Ensure every source and target entity in "edges" exists in "nodes".
+    3. Escape all embedded quotes inside node and edge strings properly.
 
     FACTS TO PROCESS:
     {facts_block}
     """
     
     response = await call_ollama(prompt, temp=0.0)
+    graph_data = extract_and_sanitize_json(response)
     
-    try:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start != -1 and json_end != -1:
-            graph_data = safe_parse_json(response[json_start:json_end])
-            return graph_data
-        else:
-            st.warning("No valid JSON structure detected in Ollama response.")
-            return {"nodes": [], "edges": []}
-    except Exception as e:
-        st.warning(f"Error parsing graph JSON: {e}")
-        st.error(f"Raw Ollama Response: {repr(response)}")
+    if isinstance(graph_data, dict) and "nodes" in graph_data and "edges" in graph_data:
+        return graph_data
+    else:
+        st.warning("Could not structure valid graph data from LLM response.")
         return {"nodes": [], "edges": []}
 
 # Stage 3B: Critic Loop Verification Agent
 async def verify_triples_critic(raw_text_corpus: str, unverified_graph: dict) -> dict:
-    """Stage 3B: Critic Loop Agent - Cross-checks triples against raw text."""
     edges = unverified_graph.get("edges", [])
     nodes = unverified_graph.get("nodes", [])
     
@@ -261,7 +331,7 @@ async def verify_triples_critic(raw_text_corpus: str, unverified_graph: dict) ->
     CRITICAL RULES:
     1. If a triple's relationship, numbers, dates, or names are 100% EXPLICITLY supported by the raw text, mark it as 1.
     2. If a triple contains invented numbers, incorrect entity links, ads, or unsupported claims, mark it as 0.
-    3. Output STRICTLY a JSON array of objects with "id" and "status" (1 for PASS, 0 for FAIL).
+    3. Output STRICTLY a raw JSON array of objects with "id" and "status" (1 for PASS, 0 for FAIL).
 
     RAW SOURCE TEXT:
     {raw_text_corpus[:4000]}
@@ -277,37 +347,29 @@ async def verify_triples_critic(raw_text_corpus: str, unverified_graph: dict) ->
     """
 
     response = await call_ollama(critic_prompt, temp=0.0)
+    verdict_list = extract_and_sanitize_json(response)
 
-    try:
-        json_start = response.find("[")
-        json_end = response.rfind("]") + 1
-        if json_start != -1 and json_end != -1:
-            verdict_list = safe_parse_json(response[json_start:json_end])
-            
-            passed_ids = {item["id"] for item in verdict_list if item.get("status") == 1}
-            verified_edges = [edge for idx, edge in enumerate(edges) if idx in passed_ids]
-            
-            active_node_names = set()
-            for edge in verified_edges:
-                active_node_names.add(edge.get("source"))
-                active_node_names.add(edge.get("target"))
+    if isinstance(verdict_list, list) and len(verdict_list) > 0:
+        passed_ids = {item["id"] for item in verdict_list if isinstance(item, dict) and item.get("status") == 1}
+        verified_edges = [edge for idx, edge in enumerate(edges) if idx in passed_ids]
+        
+        active_node_names = set()
+        for edge in verified_edges:
+            active_node_names.add(edge.get("source"))
+            active_node_names.add(edge.get("target"))
 
-            verified_nodes = [n for n in nodes if n.get("id") in active_node_names]
+        verified_nodes = [n for n in nodes if n.get("id") in active_node_names]
 
-            return {"nodes": verified_nodes, "edges": verified_edges}
-            
-    except Exception as e:
-        st.warning(f"Verification parser error: {e}. Falling back to default graph.")
-        return unverified_graph
+        return {"nodes": verified_nodes, "edges": verified_edges}
 
+    st.warning("Verification parser error. Retaining raw graph data.")
     return unverified_graph
 
 # Stage 4A: Universal Outline Planner Agent
 async def create_chapter_outline(topic: str, num_chapters: int, graph_data: dict) -> list[str]:
-    """Dynamically divides knowledge triples across any domain into distinct thematic chapters."""
     edges = graph_data.get("edges", [])
     if not edges:
-        return [f"General Overview of {topic}" for _ in range(num_chapters)]
+        return [f"General Overview and Findings on {topic}" for _ in range(num_chapters)]
 
     kg_triples = "\n".join(
         [f"[T{idx}] ({e.get('source')}) ──[{e.get('relation')}]──► ({e.get('target')})"
@@ -320,32 +382,24 @@ async def create_chapter_outline(topic: str, num_chapters: int, graph_data: dict
 
     TASK:
     Partition all the available triple IDs [T0, T1, T2...] into {num_chapters} thematic focuses.
-    - Chapter 1: Cover foundational concepts, origins, core definitions, or early history.
-    - Chapter 2+: Cover applications, developments, challenges, key features, or future implications.
 
     VERIFIED TRIPLES AVAILABLE:
     {kg_triples}
 
-    OUTPUT FORMAT: Return strictly a JSON list of {num_chapters} strings describing the target focus and triple IDs for each chapter.
+    OUTPUT FORMAT: Return strictly a raw JSON list of {num_chapters} strings describing the target focus and triple IDs for each chapter.
     EXAMPLE:
     [
-      "Focus on Core Definitions, History, and Founding Context (Triples T0 to T8)",
-      "Focus on Major Features, Applications, and Industry Use Cases (Triples T9 to T20)"
+      "Focus on Core Concepts and Architecture (Triples T0 to T8)",
+      "Focus on Features, Workflows, and Performance (Triples T9 to T20)"
     ]
     """
     
     response = await call_ollama(prompt, temp=0.0)
-    try:
-        json_start = response.find("[")
-        json_end = response.rfind("]") + 1
-        if json_start != -1 and json_end != -1:
-            outlines = safe_parse_json(response[json_start:json_end])
-            if len(outlines) == num_chapters:
-                return outlines
-    except Exception as e:
-        st.warning(f"Outline planner error: {e}. Using automatic slice strategy.")
+    outlines = extract_and_sanitize_json(response)
+    
+    if isinstance(outlines, list) and len(outlines) == num_chapters:
+        return outlines
         
-    # Fallback: Partition triples evenly if LLM JSON fails
     step = max(1, len(edges) // num_chapters)
     fallback_outlines = []
     for i in range(num_chapters):
@@ -355,39 +409,48 @@ async def create_chapter_outline(topic: str, num_chapters: int, graph_data: dict
     return fallback_outlines
 
 # Stage 4B: Grounded Synthesis Engine
-async def generate_chapter_from_graph(chapter_num: int, total_chapters: int, topic: str, chapter_focus: str, graph_data: dict, temp: float) -> str:
-    """Synthesizes chapter content strictly grounded in its assigned thematic focus."""
-    kg_triples = "\n".join(
-        [f"[T{idx}] ({e.get('source')}) ──[{e.get('relation')}]──► ({e.get('target')})"
-         for idx, e in enumerate(graph_data.get("edges", []))]
-    )
+async def generate_chapter_from_graph(chapter_num: int, total_chapters: int, topic: str, chapter_focus: str, graph_data: dict, raw_facts: list[str], temp: float) -> str:
+    edges = graph_data.get("edges", [])
     
+    if edges:
+        kg_triples = "\n".join(
+            [f"[T{idx}] ({e.get('source')}) ──[{e.get('relation')}]──► ({e.get('target')})"
+             for idx, e in enumerate(edges)]
+        )
+        context_block = f"VERIFIED KNOWLEDGE GRAPH TRIPLES:\n{kg_triples}"
+    else:
+        facts_block = "\n".join([f"- {fact}" for fact in raw_facts[:35]])
+        context_block = f"VERIFIED RAW FACTS:\n{facts_block}"
+
     prompt = f"""
     You are an Investigative Knowledge Analyst writing Chapter {chapter_num} of {total_chapters} on "{topic}".
 
     ASSIGNED CHAPTER FOCUS:
     {chapter_focus}
 
-    CRITICAL ACCURACY & DEDUPLICATION GUARDRAILS:
-    1. Write EXCLUSIVELY about the assigned focus above.
-    2. Do NOT write a general intro/summary if this is Chapter 2 or later. Do not repeat facts covered in earlier chapters.
-    3. Every claim or sentence must explicitly cite its corresponding triple ID in brackets (e.g., [T1], [T2]).
-    4. Write in a clear, well-structured, professional report style.
+    CRITICAL ACCURACY & GROUNDING RULES:
+    1. Write EXCLUSIVELY about the assigned topic using ONLY the factual context provided below.
+    2. Do NOT invent external tools, libraries, or concepts not present in the provided context.
+    3. If citing Knowledge Graph Triples, cite their corresponding IDs in brackets (e.g., [T1], [T2]).
+    4. Write in a clean, professional, structured report format with subheadings.
 
-    VERIFIED KNOWLEDGE GRAPH TRIPLES:
-    {kg_triples}
+    {context_block}
     """
     return await call_ollama(prompt, temp=temp, timeout=300)
 
 # Graph Visualization UI
 def visualize_knowledge_graph(graph_data: dict):
+    if not graph_data.get("nodes"):
+        st.info("No network nodes available to render graph.")
+        return
+
     net = Network(height="450px", width="100%", bgcolor="#111111", font_color="white")
     
     nodes_added = set()
     for node in graph_data.get("nodes", []):
         node_id = node.get("id")
         if node_id and node_id not in nodes_added:
-            net.add_node(node_id, label=node_id, title=f"Type: {node.get('type', 'Unknown')}")
+            net.add_node(node_id, label=str(node_id), title=f"Type: {node.get('type', 'Unknown')}")
             nodes_added.add(node_id)
         
     for edge in graph_data.get("edges", []):
@@ -402,57 +465,97 @@ def visualize_knowledge_graph(graph_data: dict):
     
     with open(html_path, "r", encoding="utf-8") as f:
         html_content = f.read()
-    components.html(html_content, height=470)
+    
+    components.html(html_content, height=470, scrolling=True)
 
 # --- Main Async Core Pipeline ---
 async def async_research_pipeline():
-    if not topic.strip():
-        st.error("Please provide a valid research topic.")
-        return
+    user_urls = parse_and_clean_urls(custom_urls_input)
+    target_urls = []
+
+    status_box = st.status("🎬 Starting Zero-Hallucination Knowledge Engine Pipeline...", expanded=True)
+    
+    if scrape_mode == "Custom Links Only":
+        if not user_urls:
+            status_box.update(label="❌ Error: No valid custom URLs provided.", state="error")
+            st.error("Please enter at least one valid web URL in the sidebar text box.")
+            return
+        target_urls = user_urls
+        status_box.write(f"📌 Using {len(target_urls)} custom user-provided URL(s).")
+    else:
+        if not topic.strip() and not user_urls:
+            status_box.update(label="❌ Missing Inputs.", state="error")
+            st.error("Please provide either a research topic or at least one custom URL.")
+            return
+
+        searched_urls = []
+        if topic.strip():
+            status_box.write("🔍 Querying web indices...")
+            searched_urls = await search_web(topic, max_links)
+            
+        combined = user_urls + searched_urls
+        target_urls = list(dict.fromkeys(combined))
+        
+        if not target_urls:
+            status_box.update(label="❌ Search Failed.", state="error")
+            st.error("No target sources found from search or inputs.")
+            return
+        status_box.write(f"🌐 Targets established: {len(target_urls)} link(s) ({len(user_urls)} custom, {len(searched_urls)} searched).")
 
     flux_pipe = None
     if enable_images:
         flux_pipe = load_local_flux_pipeline()
 
-    status_box = st.status("🎬 Starting Zero-Hallucination Knowledge Engine Pipeline...", expanded=True)
-    
-    # 1. Discovery
-    status_box.write("🔍 Querying web indices...")
-    urls = await search_web(topic, max_links)
-    
-    if not urls:
-        status_box.update(label="❌ Search Failed.", state="error")
-        st.error("No relevant target sources found.")
-        return
-        
-    status_box.write(f"🌐 Located {len(urls)} live target sources. Scraping content...")
-    
-    # 2. Scraping
-    browser_config = BrowserConfig(headless=True, enable_stealth=True)
-    prune_filter = PruningContentFilter(threshold=0.45, threshold_type="dynamic")
-    md_generator = DefaultMarkdownGenerator(content_filter=prune_filter)
+    browser_config = BrowserConfig(
+        headless=not interactive_fallback,
+        user_agent_mode="random",
+        headers={"Accept-Language": "en-US,en;q=0.9"}
+    )
     
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
-        word_count_threshold=150,
+        word_count_threshold=20,
         page_timeout=60000,
         remove_overlay_elements=True,
-        markdown_generator=md_generator
+        css_selector="article.markdown-body, main, body",  # Targets GitHub README markdown container specifically
+        excluded_tags=["nav", "header", "footer", "aside"],
+        delay_before_return_html=3.0
     )
     raw_corpus = ""
     
+    status_box.write(f"🕷️ Navigating and extracting content from {len(target_urls)} links...")
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        results = await crawler.arun_many(urls=urls, config=run_config)
+        results = await crawler.arun_many(urls=target_urls, config=run_config)
         for idx, res in enumerate(results):
-            # SAFE URL RETRIEVAL TO PREVENT INDEX ERROR
-            scraped_url = getattr(res, 'url', None) or (urls[idx] if idx < len(urls) else f"Source #{idx+1}")
+            scraped_url = getattr(res, 'url', None) or (target_urls[idx] if idx < len(target_urls) else f"Source #{idx+1}")
             
-            if res.success and res.markdown:
-                content = getattr(res.markdown, 'fit_markdown', res.markdown)
-                if content and str(content).strip():
-                    raw_corpus += f"\n{content}"
+            if res.success:
+                extracted_content = ""
+                
+                if hasattr(res, 'markdown_v2') and res.markdown_v2:
+                    md_v2 = res.markdown_v2
+                    extracted_content = getattr(md_v2, 'raw_markdown', getattr(md_v2, 'fit_markdown', str(md_v2)))
+                elif hasattr(res, 'markdown') and res.markdown:
+                    md = res.markdown
+                    if isinstance(md, str):
+                        extracted_content = md
+                    elif hasattr(md, 'raw_markdown') and md.raw_markdown:
+                        extracted_content = md.raw_markdown
+                    elif hasattr(md, 'fit_markdown') and md.fit_markdown:
+                        extracted_content = md.fit_markdown
+                    else:
+                        extracted_content = str(md)
+                
+                if not extracted_content.strip() and hasattr(res, 'cleaned_html') and res.cleaned_html:
+                    extracted_content = res.cleaned_html
+                elif not extracted_content.strip() and hasattr(res, 'html') and res.html:
+                    extracted_content = res.html
+
+                if extracted_content and extracted_content.strip():
+                    raw_corpus += f"\n\n--- SOURCE: {scraped_url} ---\n{extracted_content}"
                     status_box.write(f"✅ Scraped Source #{idx+1}: {scraped_url}")
                     continue
+            
             status_box.write(f"⚠️ Warning: Failed to scrape Source #{idx+1}: {scraped_url}")
                 
     if not raw_corpus.strip():
@@ -480,7 +583,7 @@ async def async_research_pipeline():
     raw_graph_data = await build_knowledge_graph(all_disambiguated_facts)
 
     # 6. Stage 3B: Critic Loop Verification
-    status_box.write("🕵️ Stage 3B: Running Qwen Fact-Critic Verification Loop...")
+    status_box.write("🕵️ Stage 3B: Running Fact-Critic Verification Loop...")
     verified_graph_data = await verify_triples_critic(raw_corpus, raw_graph_data)
 
     status_box.update(label="🎉 Knowledge Base Verified and Sanitized!", state="complete", expanded=False)
@@ -490,7 +593,7 @@ async def async_research_pipeline():
     visualize_knowledge_graph(verified_graph_data)
 
     st.divider()
-    st.markdown(f"# 📄 Verified Investigative Report: {topic}")
+    st.markdown(f"# 📄 Verified Investigative Report: {topic if topic else 'Custom Ingestion Analysis'}")
     st.divider()
 
     # Create distinct outlines for chapters
@@ -509,6 +612,7 @@ async def async_research_pipeline():
                 topic=topic,
                 chapter_focus=chapter_focus,
                 graph_data=verified_graph_data,
+                raw_facts=all_disambiguated_facts,
                 temp=temperature
             )
             st.markdown(chapter_text)
@@ -526,17 +630,28 @@ async def async_research_pipeline():
     with st.expander("Show Raw Knowledge Graph JSON Data"):
         st.json(verified_graph_data)
 
-# --- Event Loop Wrapper ---
-def run_app():
+# --- Execution Entrypoint ---
+if st.button("🚀 Execute Autonomous Research & Generation Campaign", type="primary", disabled=st.session_state.is_running):
+    st.session_state.is_running = True
+    st.rerun()
+
+# Run the pipeline when locked state is active
+if st.session_state.is_running:
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
 
-    if loop and loop.is_running():
-        asyncio.ensure_future(async_research_pipeline())
-    else:
-        asyncio.run(async_research_pipeline())
-
-if st.button("🚀 Execute Autonomous Research & Generation Campaign", type="primary"):
-    run_app()
+        if loop and loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply(loop)
+            loop.run_until_complete(async_research_pipeline())
+        else:
+            asyncio.run(async_research_pipeline())
+    except Exception as e:
+        st.error(f"Execution Error encountered during pipeline run: {e}")
+    finally:
+        # Re-enable the UI components once the pipeline completes or throws an exception
+        st.session_state.is_running = False
+        st.rerun()
